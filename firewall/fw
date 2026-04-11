@@ -31,12 +31,12 @@ fw - Friendly firewall manager
 Usage: sudo fw <command> [args]
 
 Port management:
-  allow <port>[/udp]        Open a port or range (TCP default)
-  block <port>[/udp]        Close a port or range
+  allow <port>[/udp] ...    Open ports or ranges (TCP default)
+  block <port>[/udp] ...    Close ports or ranges
 
 IP management:
-  block-ip <ip>[/cidr]      Block an IP or subnet
-  allow-ip <ip>[/cidr]      Unblock an IP or subnet
+  block-ip <ip>[/cidr] ...  Block IPs or subnets
+  allow-ip <ip>[/cidr] ...  Unblock IPs or subnets
 
 Info:
   list                      Show allowed ports and blocked IPs
@@ -87,71 +87,73 @@ parse_port() {
 }
 
 cmd_allow() {
-    [[ -z "${1:-}" ]] && { usage; exit 1; }
-    local port proto
-    read -r port proto <<< "$(parse_port "$1")"
-
-    if nft add element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
-        green "Allowed ${proto^^} port $port"
-    else
-        yellow "Port $port is already allowed or invalid range"
-    fi
+    [[ $# -eq 0 ]] && { usage; exit 1; }
+    for arg in "$@"; do
+        local port proto
+        read -r port proto <<< "$(parse_port "$arg")"
+        if nft add element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
+            green "Allowed ${proto^^} port $port"
+        else
+            yellow "Port $port is already allowed or invalid range"
+        fi
+    done
 }
 
 cmd_block() {
-    [[ -z "${1:-}" ]] && { usage; exit 1; }
-    local port proto
-    read -r port proto <<< "$(parse_port "$1")"
-
-    if nft delete element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
-        green "Blocked ${proto^^} port $port"
-    else
-        yellow "Port $port was not in the allowed set"
-    fi
+    [[ $# -eq 0 ]] && { usage; exit 1; }
+    for arg in "$@"; do
+        local port proto
+        read -r port proto <<< "$(parse_port "$arg")"
+        if nft delete element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
+            green "Blocked ${proto^^} port $port"
+        else
+            yellow "Port $port was not in the allowed set"
+        fi
+    done
 }
 
 cmd_block_ip() {
-    [[ -z "${1:-}" ]] && { usage; exit 1; }
-    local ip="$1"
-
-    if nft add element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
-        green "Blocked IP $ip"
-    else
-        yellow "IP $ip is already blocked or invalid"
-    fi
+    [[ $# -eq 0 ]] && { usage; exit 1; }
+    for ip in "$@"; do
+        if nft add element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
+            green "Blocked IP $ip"
+        else
+            yellow "IP $ip is already blocked or invalid"
+        fi
+    done
 }
 
 cmd_allow_ip() {
-    [[ -z "${1:-}" ]] && { usage; exit 1; }
-    local ip="$1"
+    [[ $# -eq 0 ]] && { usage; exit 1; }
+    for ip in "$@"; do
+        if nft delete element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
+            green "Unblocked IP $ip"
+        else
+            yellow "IP $ip was not in the blocked set"
+        fi
+    done
+}
 
-    if nft delete element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
-        green "Unblocked IP $ip"
-    else
-        yellow "IP $ip was not in the blocked set"
-    fi
+list_set() {
+    nft list set $TABLE "$1" 2>/dev/null \
+        | sed -n '/elements/,/}/p' \
+        | sed 's/.*elements.*{//; s/}.*//' \
+        | tr ',' '\n' | sed 's/^[[:space:]]*/  /' \
+        | grep -v '^[[:space:]]*$' \
+        || echo "  (none)"
 }
 
 cmd_list() {
     bold "=== Allowed TCP Ports ==="
-    nft list set $TABLE allowed_tcp 2>/dev/null \
-        | grep -oP 'elements\s*=\s*\{\K[^}]+' \
-        | tr ',' '\n' | sed 's/^ */  /' \
-        || echo "  (none)"
+    list_set allowed_tcp
 
     echo ""
     bold "=== Allowed UDP Ports ==="
-    nft list set $TABLE allowed_udp 2>/dev/null \
-        | grep -oP 'elements\s*=\s*\{\K[^}]+' \
-        | tr ',' '\n' | sed 's/^ */  /' \
-        || echo "  (none)"
+    list_set allowed_udp
 
     echo ""
     bold "=== Blocked IPs ==="
-    nft list set $TABLE blocked_ips 2>/dev/null \
-        | grep -oP 'elements\s*=\s*\{\K[^}]+' \
-        | tr ',' '\n' | sed 's/^ */  /' \
-        || echo "  (none)"
+    list_set blocked_ips
 }
 
 cmd_status() {
@@ -200,10 +202,10 @@ fi
 
 # --- Dispatch ---
 case "${1:-}" in
-    allow)      cmd_allow "${2:-}" ;;
-    block)      cmd_block "${2:-}" ;;
-    allow-ip)   cmd_allow_ip "${2:-}" ;;
-    block-ip)   cmd_block_ip "${2:-}" ;;
+    allow)      shift; cmd_allow "$@" ;;
+    block)      shift; cmd_block "$@" ;;
+    allow-ip)   shift; cmd_allow_ip "$@" ;;
+    block-ip)   shift; cmd_block_ip "$@" ;;
     list)       cmd_list ;;
     status)     cmd_status ;;
     save)       cmd_save ;;
