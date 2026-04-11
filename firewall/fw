@@ -1,0 +1,213 @@
+#!/bin/bash
+# fw - Friendly firewall manager for nftables
+# Works alongside Docker native nftables
+#
+# Usage: sudo fw <command> [args]
+#   fw allow 80          Open TCP port 80
+#   fw allow 53/udp      Open UDP port 53
+#   fw allow 8000-9000   Open a TCP port range
+#   fw block 80          Close TCP port 80
+#   fw block-ip 10.0.0.5 Block an IP address
+#   fw allow-ip 10.0.0.5 Unblock an IP address
+#   fw list              Show allowed ports and blocked IPs
+#   fw status            Show full firewall table
+#   fw save              Persist current rules to /etc/nftables.conf
+#   fw reload            Reload rules from /etc/nftables.conf
+
+set -euo pipefail
+
+TABLE="inet firewall"
+CONF="/etc/nftables.conf"
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+fw - Friendly firewall manager
+
+Usage: sudo fw <command> [args]
+
+Port management:
+  allow <port>[/udp]        Open a port or range (TCP default)
+  block <port>[/udp]        Close a port or range
+
+IP management:
+  block-ip <ip>[/cidr]      Block an IP or subnet
+  allow-ip <ip>[/cidr]      Unblock an IP or subnet
+
+Info:
+  list                      Show allowed ports and blocked IPs
+  status                    Show full nftables firewall table
+
+Persistence:
+  save                      Save current state to /etc/nftables.conf
+  reload                    Reload from /etc/nftables.conf
+
+Examples:
+  sudo fw allow 80          Open HTTP
+  sudo fw allow 443         Open HTTPS
+  sudo fw allow 53/udp      Open DNS (UDP)
+  sudo fw allow 8000-9000   Open a range
+  sudo fw block 8080        Close port 8080
+  sudo fw block-ip 1.2.3.4  Block an IP
+  sudo fw list              Show what's open
+  sudo fw save              Persist (survives reboot)
+EOF
+}
+
+# Parse "80", "80/tcp", "80/udp", "8000-9000", "8000-9000/udp"
+parse_port() {
+    local input="$1"
+    local port proto
+
+    if [[ "$input" == */* ]]; then
+        port="${input%/*}"
+        proto="${input#*/}"
+    else
+        port="$input"
+        proto="tcp"
+    fi
+
+    # Validate protocol
+    if [[ "$proto" != "tcp" && "$proto" != "udp" ]]; then
+        red "Error: protocol must be tcp or udp, got '$proto'"
+        exit 1
+    fi
+
+    # Validate port (single or range)
+    if ! [[ "$port" =~ ^[0-9]+(-[0-9]+)?$ ]]; then
+        red "Error: invalid port '$port'"
+        exit 1
+    fi
+
+    echo "$port" "$proto"
+}
+
+cmd_allow() {
+    [[ -z "${1:-}" ]] && { usage; exit 1; }
+    local port proto
+    read -r port proto <<< "$(parse_port "$1")"
+
+    if nft add element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
+        green "Allowed ${proto^^} port $port"
+    else
+        yellow "Port $port is already allowed or invalid range"
+    fi
+}
+
+cmd_block() {
+    [[ -z "${1:-}" ]] && { usage; exit 1; }
+    local port proto
+    read -r port proto <<< "$(parse_port "$1")"
+
+    if nft delete element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
+        green "Blocked ${proto^^} port $port"
+    else
+        yellow "Port $port was not in the allowed set"
+    fi
+}
+
+cmd_block_ip() {
+    [[ -z "${1:-}" ]] && { usage; exit 1; }
+    local ip="$1"
+
+    if nft add element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
+        green "Blocked IP $ip"
+    else
+        yellow "IP $ip is already blocked or invalid"
+    fi
+}
+
+cmd_allow_ip() {
+    [[ -z "${1:-}" ]] && { usage; exit 1; }
+    local ip="$1"
+
+    if nft delete element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
+        green "Unblocked IP $ip"
+    else
+        yellow "IP $ip was not in the blocked set"
+    fi
+}
+
+cmd_list() {
+    bold "=== Allowed TCP Ports ==="
+    nft list set $TABLE allowed_tcp 2>/dev/null \
+        | grep -oP 'elements\s*=\s*\{\K[^}]+' \
+        | tr ',' '\n' | sed 's/^ */  /' \
+        || echo "  (none)"
+
+    echo ""
+    bold "=== Allowed UDP Ports ==="
+    nft list set $TABLE allowed_udp 2>/dev/null \
+        | grep -oP 'elements\s*=\s*\{\K[^}]+' \
+        | tr ',' '\n' | sed 's/^ */  /' \
+        || echo "  (none)"
+
+    echo ""
+    bold "=== Blocked IPs ==="
+    nft list set $TABLE blocked_ips 2>/dev/null \
+        | grep -oP 'elements\s*=\s*\{\K[^}]+' \
+        | tr ',' '\n' | sed 's/^ */  /' \
+        || echo "  (none)"
+}
+
+cmd_status() {
+    nft list table $TABLE
+}
+
+cmd_save() {
+    local tmp
+    tmp=$(mktemp)
+
+    {
+        echo '#!/usr/sbin/nft -f'
+        echo ''
+        echo '# Firewall config — managed by /usr/local/bin/fw'
+        echo '# WARNING: Never use "flush ruleset" — it destroys Docker tables'
+        echo ''
+        echo 'destroy table inet firewall'
+        echo ''
+        nft list table $TABLE
+    } > "$tmp"
+
+    mv "$tmp" "$CONF"
+    chmod 644 "$CONF"
+    green "Saved current firewall state to $CONF"
+}
+
+cmd_reload() {
+    nft -f "$CONF"
+    green "Reloaded firewall from $CONF"
+}
+
+# --- Root check ---
+if [[ $EUID -ne 0 ]]; then
+    red "Error: fw must be run as root"
+    echo "  Usage: sudo fw <command>"
+    exit 1
+fi
+
+# --- Check table exists ---
+if [[ "${1:-}" != "reload" ]] && ! nft list table $TABLE &>/dev/null; then
+    red "Error: firewall table not loaded"
+    echo "  Run: sudo nft -f /etc/nftables.conf"
+    echo "  Or:  sudo systemctl start nftables"
+    exit 1
+fi
+
+# --- Dispatch ---
+case "${1:-}" in
+    allow)      cmd_allow "${2:-}" ;;
+    block)      cmd_block "${2:-}" ;;
+    allow-ip)   cmd_allow_ip "${2:-}" ;;
+    block-ip)   cmd_block_ip "${2:-}" ;;
+    list)       cmd_list ;;
+    status)     cmd_status ;;
+    save)       cmd_save ;;
+    reload)     cmd_reload ;;
+    -h|--help|help) usage ;;
+    *)          usage; exit 1 ;;
+esac
