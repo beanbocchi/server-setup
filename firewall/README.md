@@ -283,3 +283,69 @@ sudo nft delete table inet firewall
 - **macvlan/ipvlan** Docker networks don't use `br-*` interfaces and won't match the bridge wildcard. Add their interfaces to `trusted_ifaces` if needed.
 - **Container outbound traffic** from bridge interfaces bypasses the gate (marked as trusted). A compromised container can make arbitrary outbound connections. For production, consider adding outbound filtering.
 - **`fw save` overwrites** `/etc/nftables.conf` with the live kernel state. If Docker is not running when you save, Docker's tables won't be affected (they're in separate tables), but make sure your firewall table is in the desired state before saving.
+
+## fail2ban Integration
+
+fail2ban monitors service logs and automatically bans offending IPs by adding them to the shared `blocked_ips` nft set — the same set used by `fw block-ip` and checked by the gate chain.
+
+### Files
+
+| File | Install location | Purpose |
+|------|-----------------|---------|
+| `fail2ban/jail.local` | `/etc/fail2ban/jail.local` | Jail definitions |
+| `fail2ban/action.d/nftables-blocked.conf` | `/etc/fail2ban/action.d/nftables-blocked.conf` | Custom action to manipulate `blocked_ips` |
+
+### Installation
+
+```bash
+# 1. Install fail2ban
+sudo pacman -S fail2ban
+
+# 2. Install config files
+sudo cp fail2ban/jail.local /etc/fail2ban/jail.local
+sudo mkdir -p /etc/fail2ban/action.d
+sudo cp fail2ban/action.d/nftables-blocked.conf /etc/fail2ban/action.d/nftables-blocked.conf
+
+# 3. Enable and start
+sudo systemctl enable --now fail2ban
+```
+
+### Jails
+
+**sshd** — brute-force protection:
+- 3 failed login attempts in 5 minutes → 1 hour ban
+- Uses `systemd` backend (reads from journalctl)
+
+**recidive** — repeat offender escalation:
+- 3 bans from any jail within 12 hours → 30 day ban
+- Monitors `/var/log/fail2ban.log`
+
+### How It Works
+
+```
+1. Attacker fails SSH login 3 times in 5 minutes
+2. fail2ban detects this in the journal
+3. fail2ban runs: nft add element inet firewall blocked_ips { <attacker-ip> }
+4. Gate chain drops all traffic from that IP immediately
+5. After 1 hour, fail2ban runs: nft delete element inet firewall blocked_ips { <attacker-ip> }
+
+If the same IP gets banned 3 times in 12 hours:
+6. Recidive jail bans them for 30 days
+```
+
+Banned IPs appear in `fw list` under "Blocked IPs" alongside manually blocked IPs. For fail2ban-specific info:
+
+```bash
+# Check jail status
+sudo fail2ban-client status sshd
+sudo fail2ban-client status recidive
+
+# Manually unban an IP
+sudo fail2ban-client set sshd unbanip 1.2.3.4
+```
+
+### Caveats
+
+- **`fw save` captures fail2ban bans** — if you run `fw save` while IPs are banned, those IPs will be persisted in `nftables.conf` and survive reboots even after fail2ban would have unbanned them. Run `fw save` when the ban list is clean, or accept that some IPs may stay blocked longer than intended.
+- **fail2ban restart clears its internal state** — on restart, fail2ban unbans all IPs it was tracking (removing them from `blocked_ips`). Previously banned IPs can reconnect until they trigger the jail again.
+- **Recidive uses file backend** — it reads `/var/log/fail2ban.log`, not the journal. If log rotation deletes that file, recidive loses its history.

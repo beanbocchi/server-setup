@@ -1,0 +1,27 @@
+# fail2ban jail config — integrates with nftables blocked_ips set
+# Install: sudo cp -r fail2ban/ /etc/fail2ban/
+
+[DEFAULT]
+# Use the custom action that writes to our shared blocked_ips set
+banaction = nftables-blocked
+
+# Arch Linux uses systemd journal for logging
+backend = systemd
+
+# ── sshd jail ────────────────────────────────────────────
+# 3 failures in 5 minutes → 1 hour ban
+[sshd]
+enabled  = true
+maxretry = 3
+findtime = 5m
+bantime  = 1h
+
+# ── recidive jail ────────────────────────────────────────
+# 3 bans from any jail within 12 hours → 30 day ban
+[recidive]
+enabled   = true
+logpath   = /var/log/fail2ban.log
+backend   = auto
+maxretry  = 3
+findtime  = 12h
+bantime   = 30d
