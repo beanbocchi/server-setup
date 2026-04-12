@@ -3,26 +3,32 @@
 # Works alongside Docker native nftables
 #
 # Usage: sudo fw <command> [args]
-#   fw allow 80          Open TCP port 80
-#   fw allow 53/udp      Open UDP port 53
-#   fw allow 8000-9000   Open a TCP port range
-#   fw block 80          Close TCP port 80
-#   fw block-ip 10.0.0.5 Block an IP address
-#   fw allow-ip 10.0.0.5 Unblock an IP address
-#   fw list              Show allowed ports and blocked IPs
-#   fw status            Show full firewall table
-#   fw save              Persist current rules to /etc/nftables.conf
-#   fw reload            Reload rules from /etc/nftables.conf
+#   fw allow -g shopnexus 6379:redis 5432:postgres   Grouped ports
+#   fw allow 22 -l SSH                               Flat label
+#   fw allow 53/udp -l DNS                            UDP port
+#   fw allow 8000-9000 -l "Dev range"                 Port range
+#   fw block 80 -l "Removed HTTP"                     Close port
+#   fw block-ip -g scanners 1.2.3.4:bot 5.6.7.8:bot  Block IPs
+#   fw block-ip 10.0.0.1-10.0.0.50 -l "Bad range"    Block IP range
+#   fw allow-ip 10.0.0.5 -l "False positive"          Unblock IP
+#   fw label 6379 shopnexus.redis                     Retroactive label
+#   fw list                                           Show ports and IPs
+#   fw status                                         Show full table
+#   fw save                                           Persist rules
+#   fw reload                                         Reload rules
 
 set -euo pipefail
 
 TABLE="inet firewall"
 CONF="/etc/nftables.conf"
+LABELS="/etc/fw-labels.conf"
+LEGACY_COMMENTS="/etc/fw-comments.conf"
 
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+dim()    { printf '\033[2m%s\033[0m\n' "$*"; }
 
 usage() {
     cat <<'EOF'
@@ -31,12 +37,17 @@ fw - Friendly firewall manager
 Usage: sudo fw <command> [args]
 
 Port management:
-  allow <port>[/udp] ...    Open ports or ranges (TCP default)
-  block <port>[/udp] ...    Close ports or ranges
+  allow <port>[/udp][:child] ... -g <group>   Open ports (grouped)
+  allow <port>[/udp] ... -l <label>           Open ports (flat label)
+  block <port>[/udp] ... -l <label>           Close ports
 
 IP management:
-  block-ip <ip>[/cidr] ...  Block IPs or subnets
-  allow-ip <ip>[/cidr] ...  Unblock IPs or subnets
+  block-ip <ip>[:child] ... -g <group>        Block IPs (grouped)
+  block-ip <ip> ... -l <label>                Block IPs (flat label)
+  allow-ip <ip> ... -l <label>                Unblock IPs
+
+Labels:
+  label <port[/proto]|ip> <group.child|label> Relabel an existing entry
 
 Info:
   list                      Show allowed ports and blocked IPs
@@ -47,18 +58,122 @@ Persistence:
   reload                    Reload from /etc/nftables.conf
 
 Examples:
-  sudo fw allow 80          Open HTTP
-  sudo fw allow 443         Open HTTPS
-  sudo fw allow 53/udp      Open DNS (UDP)
-  sudo fw allow 8000-9000   Open a range
-  sudo fw block 8080        Close port 8080
-  sudo fw block-ip 1.2.3.4  Block an IP
-  sudo fw list              Show what's open
-  sudo fw save              Persist (survives reboot)
+  sudo fw allow -g shopnexus 6379:redis 5432:postgres 8082:api
+  sudo fw allow 22 -l SSH
+  sudo fw allow 53/udp -l DNS
+  sudo fw allow 8000-9000 -l "Dev range"
+  sudo fw block 8080 -l "Removed proxy"
+  sudo fw block-ip -g scanners 1.2.3.4:bot 5.6.7.8:bot
+  sudo fw block-ip 10.0.0.0/8 -l "Private range"
+  sudo fw allow-ip 1.2.3.4 -l "False positive"
+  sudo fw label 22 SSH
+  sudo fw label 6379 shopnexus.redis
+  sudo fw list
+  sudo fw save
 EOF
 }
 
-# Parse "80", "80/tcp", "80/udp", "8000-9000", "8000-9000/udp"
+# --- Label helpers ---
+
+init_labels() {
+    # Migrate legacy comments file
+    if [[ -f "$LEGACY_COMMENTS" && ! -f "$LABELS" ]]; then
+        mv "$LEGACY_COMMENTS" "$LABELS"
+    fi
+    [[ -f "$LABELS" ]] || touch "$LABELS"
+}
+
+save_label() {
+    local key="$1" label="$2"
+    init_labels
+    grep -v "^${key}=" "$LABELS" > "$LABELS.tmp" 2>/dev/null || true
+    echo "${key}=${label}" >> "$LABELS.tmp"
+    mv "$LABELS.tmp" "$LABELS"
+}
+
+remove_label() {
+    local key="$1"
+    init_labels
+    grep -v "^${key}=" "$LABELS" > "$LABELS.tmp" 2>/dev/null || true
+    mv "$LABELS.tmp" "$LABELS"
+}
+
+get_label() {
+    local key="$1"
+    init_labels
+    grep "^${key}=" "$LABELS" 2>/dev/null | head -1 | sed 's/^[^=]*=//' || true
+}
+
+# --- Argument parsing: extract -l, -g, and items from args ---
+
+parse_args() {
+    ITEMS=()
+    LABEL=""
+    GROUP=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -l)
+                [[ -z "${2:-}" ]] && { red "Error: -l requires a label"; exit 1; }
+                LABEL="$2"
+                shift 2
+                ;;
+            -g)
+                [[ -z "${2:-}" ]] && { red "Error: -g requires a group name"; exit 1; }
+                GROUP="$2"
+                shift 2
+                ;;
+            *)
+                ITEMS+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Validate: -l and -g are mutually exclusive, one is required
+    if [[ -n "$LABEL" && -n "$GROUP" ]]; then
+        red "Error: -l and -g are mutually exclusive"
+        exit 1
+    fi
+    if [[ -z "$LABEL" && -z "$GROUP" ]]; then
+        red "Error: -l <label> or -g <group> is required"
+        exit 1
+    fi
+}
+
+# Build the full label string for a given item
+build_label() {
+    local item="$1"
+    local child=""
+
+    if [[ -n "$GROUP" ]]; then
+        # Extract :child suffix if present
+        if [[ "$item" == *:* ]]; then
+            child="${item##*:}"
+        fi
+        if [[ -n "$child" ]]; then
+            echo "${GROUP}.${child}"
+        else
+            echo "${GROUP}"
+        fi
+    else
+        echo "$LABEL"
+    fi
+}
+
+# Strip :child suffix from an item to get the raw port/ip
+strip_child() {
+    local item="$1"
+    if [[ -n "$GROUP" && "$item" == *:* ]]; then
+        # Only strip if it's a child label, not a port/proto separator
+        # Port/proto uses / not : so any : is a child label
+        echo "${item%%:*}"
+    else
+        echo "$item"
+    fi
+}
+
+# --- Port parsing ---
+
 parse_port() {
     local input="$1"
     local port proto
@@ -68,16 +183,14 @@ parse_port() {
         proto="${input#*/}"
     else
         port="$input"
-        proto="tcp"
+        proto="both"
     fi
 
-    # Validate protocol
-    if [[ "$proto" != "tcp" && "$proto" != "udp" ]]; then
+    if [[ "$proto" != "tcp" && "$proto" != "udp" && "$proto" != "both" ]]; then
         red "Error: protocol must be tcp or udp, got '$proto'"
         exit 1
     fi
 
-    # Validate port (single or range)
     if ! [[ "$port" =~ ^[0-9]+(-[0-9]+)?$ ]]; then
         red "Error: invalid port '$port'"
         exit 1
@@ -86,74 +199,315 @@ parse_port() {
     echo "$port" "$proto"
 }
 
-cmd_allow() {
-    [[ $# -eq 0 ]] && { usage; exit 1; }
-    for arg in "$@"; do
-        local port proto
-        read -r port proto <<< "$(parse_port "$arg")"
-        if nft add element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
-            green "Allowed ${proto^^} port $port"
+# --- IP validation ---
+
+validate_ip_arg() {
+    local input="$1"
+    if [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)?(/[0-9]+)?$ ]]; then
+        return 0
+    fi
+    red "Error: invalid IP address or range '$input'"
+    exit 1
+}
+
+# --- Commands ---
+
+add_port() {
+    local port="$1" proto="$2" label="$3"
+    if [[ "$proto" == "both" ]]; then
+        local ok=false
+        if nft add element $TABLE allowed_tcp "{ $port }" 2>/dev/null; then ok=true; fi
+        if nft add element $TABLE allowed_udp "{ $port }" 2>/dev/null; then ok=true; fi
+        if $ok; then
+            green "Allowed TCP+UDP port $port"
+            save_label "${port}" "$label"
         else
             yellow "Port $port is already allowed or invalid range"
         fi
+    else
+        if nft add element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
+            green "Allowed ${proto^^} port $port"
+            save_label "${port}/${proto}" "$label"
+        else
+            yellow "Port $port is already allowed or invalid range"
+        fi
+    fi
+}
+
+cmd_allow() {
+    parse_args "$@"
+    [[ ${#ITEMS[@]} -eq 0 ]] && { usage; exit 1; }
+
+    for item in "${ITEMS[@]}"; do
+        local raw label port proto
+        raw=$(strip_child "$item")
+        label=$(build_label "$item")
+        read -r port proto <<< "$(parse_port "$raw")"
+        add_port "$port" "$proto" "$label"
     done
 }
 
 cmd_block() {
-    [[ $# -eq 0 ]] && { usage; exit 1; }
-    for arg in "$@"; do
-        local port proto
-        read -r port proto <<< "$(parse_port "$arg")"
-        if nft delete element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
-            green "Blocked ${proto^^} port $port"
+    parse_args "$@"
+    [[ ${#ITEMS[@]} -eq 0 ]] && { usage; exit 1; }
+
+    for item in "${ITEMS[@]}"; do
+        local raw port proto
+        raw=$(strip_child "$item")
+        read -r port proto <<< "$(parse_port "$raw")"
+        if [[ "$proto" == "both" ]]; then
+            local ok=false
+            if nft delete element $TABLE allowed_tcp "{ $port }" 2>/dev/null; then ok=true; fi
+            if nft delete element $TABLE allowed_udp "{ $port }" 2>/dev/null; then ok=true; fi
+            if $ok; then
+                green "Blocked TCP+UDP port $port"
+                remove_label "${port}"
+            else
+                yellow "Port $port was not in the allowed set"
+            fi
         else
-            yellow "Port $port was not in the allowed set"
+            if nft delete element $TABLE "allowed_${proto}" "{ $port }" 2>/dev/null; then
+                green "Blocked ${proto^^} port $port"
+                remove_label "${port}/${proto}"
+            else
+                yellow "Port $port was not in the allowed set"
+            fi
         fi
     done
 }
 
 cmd_block_ip() {
-    [[ $# -eq 0 ]] && { usage; exit 1; }
-    for ip in "$@"; do
-        if nft add element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
-            green "Blocked IP $ip"
+    parse_args "$@"
+    [[ ${#ITEMS[@]} -eq 0 ]] && { usage; exit 1; }
+
+    for item in "${ITEMS[@]}"; do
+        local raw label
+        raw=$(strip_child "$item")
+        label=$(build_label "$item")
+        validate_ip_arg "$raw"
+        if nft add element $TABLE blocked_ips "{ $raw }" 2>/dev/null; then
+            green "Blocked IP $raw"
+            save_label "$raw" "$label"
         else
-            yellow "IP $ip is already blocked or invalid"
+            yellow "IP $raw is already blocked or invalid"
         fi
     done
 }
 
 cmd_allow_ip() {
-    [[ $# -eq 0 ]] && { usage; exit 1; }
-    for ip in "$@"; do
-        if nft delete element $TABLE blocked_ips "{ $ip }" 2>/dev/null; then
-            green "Unblocked IP $ip"
+    parse_args "$@"
+    [[ ${#ITEMS[@]} -eq 0 ]] && { usage; exit 1; }
+
+    for item in "${ITEMS[@]}"; do
+        local raw
+        raw=$(strip_child "$item")
+        validate_ip_arg "$raw"
+        if nft delete element $TABLE blocked_ips "{ $raw }" 2>/dev/null; then
+            green "Unblocked IP $raw"
+            remove_label "$raw"
         else
-            yellow "IP $ip was not in the blocked set"
+            yellow "IP $raw was not in the blocked set"
         fi
     done
 }
 
+cmd_label() {
+    [[ -z "${1:-}" || -z "${2:-}" ]] && { red "Usage: fw label <port[/proto]|ip> <label>"; exit 1; }
+    local key="$1" label="$2"
+
+    # Bare port (no /proto) = both protocols, stored without suffix
+    # Port with /tcp or /udp = specific protocol
+    # Anything with dots = IP address, stored as-is
+
+    save_label "$key" "$label"
+    green "Label set: $key → $label"
+}
+
+# --- List with hierarchical labels ---
+
 list_set() {
-    nft list set $TABLE "$1" 2>/dev/null \
+    local set_name="$1" key_suffix="${2:-}"
+    local elements
+    elements=$(nft list set $TABLE "$set_name" 2>/dev/null \
         | sed -n '/elements/,/}/p' \
         | sed 's/.*elements.*{//; s/}.*//' \
-        | tr ',' '\n' | sed 's/^[[:space:]]*/  /' \
-        | grep -v '^[[:space:]]*$' \
-        || echo "  (none)"
+        | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' || true)
+
+    [[ -z "$elements" ]] && { echo "  (none)"; return; }
+
+    # Build display list preserving nft order, grouping adjacent same-group entries
+    # Each display item is either "flat|content" or "group|name|entries"
+    local -a display_types=()
+    local -a display_data=()
+    local -a group_names=()
+    local -a group_entries=()
+
+    while IFS= read -r elem; do
+        [[ -z "$elem" ]] && continue
+        local key="${elem}${key_suffix}"
+        local label
+        label=$(get_label "$key")
+
+        if [[ -z "$label" ]]; then
+            display_types+=("flat")
+            display_data+=("$(printf '  %-18s%s' "${elem}${key_suffix}" "$(dim '(no label)')")")
+        elif [[ "$label" == *.* ]]; then
+            local group="${label%%.*}"
+            local child="${label#*.}"
+
+            # Find existing group
+            local found=-1 i
+            for i in "${!group_names[@]}"; do
+                if [[ "${group_names[$i]}" == "$group" ]]; then
+                    found=$i
+                    break
+                fi
+            done
+
+            if [[ $found -ge 0 ]]; then
+                group_entries[$found]+=$'\n'"${elem}${key_suffix} ${child}"
+            else
+                group_names+=("$group")
+                group_entries+=("${elem}${key_suffix} ${child}")
+                display_types+=("group")
+                display_data+=("$((${#group_names[@]} - 1))")
+            fi
+        else
+            display_types+=("flat")
+            display_data+=("  ${label}: ${elem}${key_suffix}")
+        fi
+    done <<< "$elements"
+
+    # Print in encounter order
+    for i in "${!display_types[@]}"; do
+        if [[ "${display_types[$i]}" == "group" ]]; then
+            local gi="${display_data[$i]}"
+            bold "  ${group_names[$gi]}:"
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local e="${line%% *}"
+                local c="${line#* }"
+                printf '    %-16s%s\n' "$e" "$c"
+            done <<< "${group_entries[$gi]}"
+        else
+            echo "${display_data[$i]}"
+        fi
+    done
+}
+
+list_ports() {
+    local tcp_elems udp_elems
+    tcp_elems=$(nft list set $TABLE allowed_tcp 2>/dev/null \
+        | sed -n '/elements/,/}/p' \
+        | sed 's/.*elements.*{//; s/}.*//' \
+        | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' || true)
+
+    udp_elems=$(nft list set $TABLE allowed_udp 2>/dev/null \
+        | sed -n '/elements/,/}/p' \
+        | sed 's/.*elements.*{//; s/}.*//' \
+        | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' || true)
+
+    # Build sets for membership checks
+    local -a tcp_list=() udp_list=()
+    while IFS= read -r e; do [[ -n "$e" ]] && tcp_list+=("$e"); done <<< "$tcp_elems"
+    while IFS= read -r e; do [[ -n "$e" ]] && udp_list+=("$e"); done <<< "$udp_elems"
+
+    in_list() {
+        local needle="$1"; shift
+        for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done
+        return 1
+    }
+
+    # Build display entries: port with display suffix
+    # - in both sets → bare port, label key = "port"
+    # - tcp only → port/tcp, label key = "port/tcp"
+    # - udp only → port/udp, label key = "port/udp"
+    local -a entries=()    # "display_name|label_key"
+    local -a seen=()
+
+    for port in "${tcp_list[@]}"; do
+        if in_list "$port" "${udp_list[@]}"; then
+            entries+=("${port}|${port}")
+            seen+=("$port")
+        else
+            entries+=("${port}/tcp|${port}/tcp")
+        fi
+    done
+    for port in "${udp_list[@]}"; do
+        if in_list "$port" "${seen[@]}" 2>/dev/null; then
+            continue  # already handled as "both"
+        fi
+        entries+=("${port}/udp|${port}/udp")
+    done
+
+    [[ ${#entries[@]} -eq 0 ]] && { echo "  (none)"; return; }
+
+    local -a display_types=()
+    local -a display_data=()
+    local -a group_names=()
+    local -a group_entries=()
+
+    for entry in "${entries[@]}"; do
+        local display_name="${entry%%|*}"
+        local label_key="${entry##*|}"
+        local label
+        label=$(get_label "$label_key")
+
+        if [[ -z "$label" ]]; then
+            display_types+=("flat")
+            display_data+=("$(printf '  %-18s%s' "$display_name" "$(dim '(no label)')")")
+        elif [[ "$label" == *.* ]]; then
+            local group="${label%%.*}"
+            local child="${label#*.}"
+
+            local found=-1 i
+            for i in "${!group_names[@]}"; do
+                if [[ "${group_names[$i]}" == "$group" ]]; then
+                    found=$i
+                    break
+                fi
+            done
+
+            if [[ $found -ge 0 ]]; then
+                group_entries[$found]+=$'\n'"${display_name} ${child}"
+            else
+                group_names+=("$group")
+                group_entries+=("${display_name} ${child}")
+                display_types+=("group")
+                display_data+=("$((${#group_names[@]} - 1))")
+            fi
+        else
+            display_types+=("flat")
+            display_data+=("  ${label}: ${display_name}")
+        fi
+    done
+
+    for i in "${!display_types[@]}"; do
+        if [[ "${display_types[$i]}" == "group" ]]; then
+            local gi="${display_data[$i]}"
+            bold "  ${group_names[$gi]}:"
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local e="${line%% *}"
+                local c="${line#* }"
+                printf '    %-16s%s\n' "$e" "$c"
+            done <<< "${group_entries[$gi]}"
+        else
+            echo "${display_data[$i]}"
+        fi
+    done
 }
 
 cmd_list() {
-    bold "=== Allowed TCP Ports ==="
-    list_set allowed_tcp
-
-    echo ""
-    bold "=== Allowed UDP Ports ==="
-    list_set allowed_udp
+    bold "=== Allowed Ports ==="
+    list_ports
 
     echo ""
     bold "=== Blocked IPs ==="
-    list_set blocked_ips
+    list_set blocked_ips ""
 }
 
 cmd_status() {
@@ -206,6 +560,7 @@ case "${1:-}" in
     block)      shift; cmd_block "$@" ;;
     allow-ip)   shift; cmd_allow_ip "$@" ;;
     block-ip)   shift; cmd_block_ip "$@" ;;
+    label)      shift; cmd_label "$@" ;;
     list)       cmd_list ;;
     status)     cmd_status ;;
     save)       cmd_save ;;
