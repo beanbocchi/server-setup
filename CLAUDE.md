@@ -26,6 +26,16 @@ fail2ban monitors sshd logs and adds offending IPs directly to the existing `blo
 - **sshd jail**: 1h ban after 3 failures in 5min
 - **recidive jail**: 30 day ban after 3 jail hits in 12h (escalation for repeat offenders)
 
+### k3d/ — Runbook for k3d/k3s DNS on this host
+
+Not a config module — a troubleshooting runbook. The combination on this host (Docker 29 **nftables backend** + the custom nftables firewall + k3d's default `K3D_FIX_DNS`) breaks in-cluster DNS in four independent ways. `k3d/README.md` has the verified cluster-create recipe and per-symptom diagnostics.
+
+Key facts:
+- **Firewall must allow DNS from Docker bridges.** The `input` chain in `firewall/nftables.conf` includes two rules permitting tcp/udp 53 from `docker0`/`br-*` to the host. Without them, container→embedded-DNS is rejected (ICMP still passes, so ping misleadingly works).
+- **`K3D_FIX_DNS` (on by default) is harmful here.** It rewrites the node resolv.conf to the bridge gateway (`172.19.0.1`), which has no resolver under the nftables backend. Create clusters with `K3D_FIX_DNS=false` (in the shell env, not `--env`) and pin a real resolv.conf via `--volume`.
+- **Single-node ClusterIP needs hairpin masquerade.** Add `--k3s-arg '--kube-proxy-arg=masquerade-all=true@server:*'` or same-node pod→ClusterIP→pod (incl. CoreDNS `10.43.0.10`) times out.
+- **Do not revert Docker to the iptables backend** — the firewall design depends on the nftables backend.
+
 ### Files and install locations
 
 | File | Installs to | Requires |
