@@ -23,12 +23,7 @@ K3D_FIX_DNS=false k3d cluster create main \
   --k3s-arg '--kube-proxy-arg=masquerade-all=true@server:*'
 ```
 
-**Prerequisite (one-time):** the firewall must allow DNS from Docker bridges into the host.
-Already present in [`../firewall/nftables.conf`](../firewall/nftables.conf) (two rules in the `input` chain). If the firewall gets reset, re-apply:
-
-```bash
-sudo cp ~/linux-server-setup/firewall/nftables.conf /etc/nftables.conf && sudo nft -f /etc/nftables.conf
-```
+**Prerequisite:** the firewall must permit DNS from the Docker bridges to the host — two rules in the `input` chain of [`../firewall/nftables.conf`](../firewall/nftables.conf). This is *not* a public port-53 opening (external 53 is still dropped by the gate); it only lets containers reach the host's embedded resolver. It ships as part of the firewall config, so no k3d-specific step is needed — just make sure the current `nftables.conf` is loaded.
 
 > ⚠️ `K3D_FIX_DNS=false` must be in the **environment of the shell running k3d**, NOT passed as `--env` to the node.
 > If you don't disable it, k3d fails with: `Cannot activate DNS fix (K3D_FIX_DNS) when there's a file mounted at /etc/resolv.conf!`
