@@ -1,0 +1,10 @@
+# ShopNexus dev and prod stacks on k3d (shopnexus/infra, edge mode
+# behind-proxy). Caddy holds TLS; Traefik in the cluster routes by Host.
+# Install: sudo cp caddy/shopnexus.caddy /etc/caddy/conf.d/ && sudo systemctl reload caddy
+shopnexus.id.vn, api.shopnexus.id.vn, ops.shopnexus.id.vn, media.shopnexus.id.vn, docs.shopnexus.id.vn,
+dev.shopnexus.id.vn, api.dev.shopnexus.id.vn, ops.dev.shopnexus.id.vn, media.dev.shopnexus.id.vn, docs.dev.shopnexus.id.vn {
+	request_body {
+		max_size 50MB
+	}
+	reverse_proxy 127.0.0.1:18080
+}
