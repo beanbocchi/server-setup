@@ -1,10 +1,13 @@
 # ShopNexus dev and prod stacks on k3d (shopnexus/infra, edge mode
 # behind-proxy). Caddy holds TLS; Traefik in the cluster routes by Host.
+# Port 18090, set in ~/shopnexus-k3d/k3d.yaml: pcshop kafka-ui holds 18080.
 # Install: sudo cp caddy/shopnexus.caddy /etc/caddy/conf.d/ && sudo systemctl reload caddy
 shopnexus.id.vn, api.shopnexus.id.vn, console.shopnexus.id.vn, media.shopnexus.id.vn, docs.shopnexus.id.vn,
-dev.shopnexus.id.vn, api.dev.shopnexus.id.vn, console.dev.shopnexus.id.vn, media.dev.shopnexus.id.vn, docs.dev.shopnexus.id.vn {
+dev.shopnexus.id.vn, api.dev.shopnexus.id.vn, console.dev.shopnexus.id.vn, media.dev.shopnexus.id.vn, docs.dev.shopnexus.id.vn,
+# The operations dashboards, each behind the console sign-in (Traefik forwardAuth).
+grafana.dev.shopnexus.id.vn, restate.dev.shopnexus.id.vn, litellm.dev.shopnexus.id.vn, s3.dev.shopnexus.id.vn {
 	request_body {
 		max_size 50MB
 	}
-	reverse_proxy 127.0.0.1:18080
+	reverse_proxy 127.0.0.1:18090
 }
