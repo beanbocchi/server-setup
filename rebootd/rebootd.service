@@ -1,0 +1,17 @@
+[Unit]
+Description=Remote reboot listener (HMAC-signed UDP)
+Documentation=https://github.com/beanbocchi/server-setup/tree/main/rebootd
+
+[Service]
+ExecStart=/usr/local/bin/rebootd -listen :39017 -key /etc/rebootd/key
+Restart=always
+RestartSec=2
+OOMScoreAdjust=-1000
+Nice=-10
+LimitMEMLOCK=infinity
+MemoryMin=64M
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

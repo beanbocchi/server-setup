@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Send a signed command to rebootd over UDP.
+
+Usage: remote-reboot [--host HOST] [--port PORT] [--key FILE] ping|reboot|reboot-now
+
+HOST, PORT and the key file default to $REMOTE_REBOOT_HOST, $REMOTE_REBOOT_PORT
+and ~/.config/remote-reboot/key. Pass an IP address as HOST when the DDNS name
+is out of date.
+"""
+import argparse
+import hashlib
+import hmac
+import os
+import secrets
+import socket
+import sys
+import time
+
+
+def sign(key: bytes, msg: str) -> str:
+    return hmac.new(key, msg.encode(), hashlib.sha256).hexdigest()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Send a signed command to rebootd.")
+    p.add_argument("action", choices=["ping", "reboot", "reboot-now"])
+    p.add_argument("--host", default=os.environ.get("REMOTE_REBOOT_HOST", "khoakomlem-internal.ddns.net"))
+    p.add_argument("--port", type=int, default=int(os.environ.get("REMOTE_REBOOT_PORT", "39017")))
+    p.add_argument("--key", default=os.path.expanduser("~/.config/remote-reboot/key"))
+    p.add_argument("--tries", type=int, default=3)
+    p.add_argument("--timeout", type=float, default=3.0, help="seconds to wait for each reply")
+    args = p.parse_args()
+
+    with open(args.key) as f:
+        key = bytes.fromhex(f.read().strip())
+
+    infos = socket.getaddrinfo(args.host, args.port, type=socket.SOCK_DGRAM)
+    family, _, _, _, addr = infos[0]
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.settimeout(args.timeout)
+
+    # Each try uses a new nonce, because rebootd rejects a nonce it has seen.
+    # A second reboot request is harmless: rebootd runs the reboot once.
+    for attempt in range(1, args.tries + 1):
+        nonce = secrets.token_hex(16)
+        msg = f"v1 {args.action} {int(time.time())} {nonce}"
+        sock.sendto(f"{msg} {sign(key, msg)}".encode(), addr)
+        try:
+            data, _ = sock.recvfrom(1024)
+        except socket.timeout:
+            print(f"try {attempt}/{args.tries}: no reply from {addr[0]}:{args.port}", file=sys.stderr)
+            continue
+        text, _, mac = data.decode(errors="replace").rpartition(" ")
+        if not hmac.compare_digest(sign(key, f"{nonce} {text}"), mac):
+            print(f"try {attempt}/{args.tries}: reply has a bad signature: {text!r}", file=sys.stderr)
+            continue
+        print(text)
+        return 0
+    print("no valid reply; check the host, the router port forward and the clocks", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
